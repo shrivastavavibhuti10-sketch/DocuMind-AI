@@ -1,0 +1,435 @@
+!pip install fastapi uvicorn pymupdf sentence-transformers faiss-cpu groq gradio nest-asyncio pyngrok
+
+import fitz
+
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    full_text = ""
+    for page in doc:
+        full_text += page.get_text()
+    return full_text
+
+def chunk_text(text, chunk_size=500, overlap=50):
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), chunk_size - overlap):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+print("✅ PDF processing ready!")
+
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+print("⏳ Loading embedding model...")
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+print("✅ Embedding model loaded!")
+
+chunks_store = []
+index = None
+
+def build_vector_store(chunks):
+    global chunks_store, index
+    chunks_store = chunks
+    print(f"⏳ Embedding {len(chunks)} chunks...")
+    embeddings = embedder.encode(chunks, show_progress_bar=True)
+    embeddings = np.array(embeddings).astype('float32')
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+    print(f"✅ {index.ntotal} chunks indexed!")
+
+def retrieve(query, top_k=4):
+    query_vec = embedder.encode([query]).astype('float32')
+    distances, indices = index.search(query_vec, top_k)
+    return [chunks_store[i] for i in indices[0]]
+
+print("✅ Vector store ready!")
+
+from groq import Groq
+
+GROQ_API_KEY = "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"  # 👈 Your key here
+
+client = Groq(api_key=GROQ_API_KEY)
+
+def ask_groq(question, context_chunks):
+    context = "\n\n".join(context_chunks)
+    prompt = f"""Answer the question using only the context below.
+
+Context:
+{context}
+
+Question: {question}
+
+If the answer is not in the context, say "I couldn't find that in the document."
+"""
+    response = client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024
+    )
+    return response.choices[0].message.content
+
+print("✅ Groq LLM ready!")
+
+import gradio as gr
+
+pdf_indexed = False
+
+custom_css = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+* { font-family: 'Inter', sans-serif !important; }
+
+body { background: #f0f4f8 !important; }
+
+.gradio-container {
+    max-width: 1200px !important;
+    margin: 0 auto !important;
+    background: #f0f4f8 !important;
+}
+
+/* Header */
+.app-header {
+    background: linear-gradient(135deg, #1e3a5f, #2d6a9f) !important;
+    padding: 28px 36px !important;
+    border-radius: 16px !important;
+    margin-bottom: 24px !important;
+    box-shadow: 0 4px 20px rgba(30,58,95,0.3) !important;
+}
+
+/* Tabs */
+.tab-nav {
+    background: #ffffff !important;
+    border-radius: 12px !important;
+    padding: 6px !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08) !important;
+    border: none !important;
+}
+
+.tab-nav button {
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    font-size: 14px !important;
+    padding: 10px 24px !important;
+    color: #64748b !important;
+    border: none !important;
+    transition: all 0.2s !important;
+}
+
+.tab-nav button.selected {
+    background: linear-gradient(135deg, #1e3a5f, #2d6a9f) !important;
+    color: white !important;
+    box-shadow: 0 2px 8px rgba(30,58,95,0.3) !important;
+}
+
+/* Panels */
+.panel {
+    background: #ffffff !important;
+    border-radius: 14px !important;
+    padding: 20px !important;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.06) !important;
+    border: 1px solid #e2e8f0 !important;
+}
+
+/* Buttons */
+button.primary {
+    background: linear-gradient(135deg, #1e3a5f, #2d6a9f) !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 14px !important;
+    padding: 12px 24px !important;
+    color: white !important;
+    box-shadow: 0 4px 12px rgba(30,58,95,0.3) !important;
+    transition: all 0.2s !important;
+}
+
+button.primary:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 6px 16px rgba(30,58,95,0.4) !important;
+}
+
+/* Input boxes */
+textarea, input[type="text"] {
+    border: 1.5px solid #e2e8f0 !important;
+    border-radius: 10px !important;
+    padding: 12px 16px !important;
+    font-size: 14px !important;
+    background: #f8fafc !important;
+    transition: border-color 0.2s !important;
+}
+
+textarea:focus, input:focus {
+    border-color: #2d6a9f !important;
+    outline: none !important;
+    background: #ffffff !important;
+}
+
+/* Chat bubbles */
+.message.user {
+    background: linear-gradient(135deg, #1e3a5f, #2d6a9f) !important;
+    color: white !important;
+    border-radius: 18px 18px 4px 18px !important;
+    padding: 12px 16px !important;
+}
+
+.message.bot {
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 18px 18px 18px 4px !important;
+    padding: 12px 16px !important;
+    color: #1e293b !important;
+}
+
+/* Status box */
+.status-box {
+    background: #f0fdf4 !important;
+    border: 1px solid #86efac !important;
+    border-radius: 10px !important;
+    color: #166534 !important;
+    font-weight: 500 !important;
+}
+
+/* Labels */
+label {
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    color: #374151 !important;
+    letter-spacing: 0.3px !important;
+}
+
+/* File upload */
+.file-preview {
+    border: 2px dashed #2d6a9f !important;
+    border-radius: 12px !important;
+    background: #f0f7ff !important;
+}
+
+/* Chatbot container */
+.chatbot {
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 14px !important;
+    background: #f8fafc !important;
+}
+"""
+
+def process_pdf(pdf_file):
+    global pdf_indexed
+    text = extract_text_from_pdf(pdf_file.name)
+    chunks = chunk_text(text)
+    build_vector_store(chunks)
+    pdf_indexed = True
+    return f"✅ PDF indexed! {len(chunks)} chunks ready!"
+
+def answer_question(question, history):
+    if not pdf_indexed:
+        history.append(("", "⚠️ Please upload and index a PDF first!"))
+        return history
+    if not question.strip():
+        return history
+    try:
+        context = retrieve(question, top_k=4)
+        answer = ask_groq(question, context)
+        history.append((question, answer))
+    except Exception as e:
+        history.append((question, f"❌ Error: {str(e)}"))
+    return history
+
+def solve_math(problem, history):
+    if not problem.strip():
+        return history
+    try:
+        prompt = f"""You are an expert math teacher. Solve this problem step by step.
+
+Problem: {problem}
+
+Instructions:
+- Show every step clearly
+- Explain what you are doing at each step
+- Give the final answer at the end
+- Use simple language
+"""
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048
+        )
+        answer = response.choices[0].message.content
+        history.append((problem, answer))
+    except Exception as e:
+        history.append((problem, f"❌ Error: {str(e)}"))
+    return history
+
+with gr.Blocks(css=custom_css, title="PDF Q&A Assistant") as app:
+
+    gr.Markdown("""
+    <div style="background:linear-gradient(135deg,#1e3a5f,#2d6a9f);
+    padding:28px 36px;border-radius:16px;margin-bottom:8px;
+    box-shadow:0 4px 20px rgba(30,58,95,0.3)">
+    <h1 style="color:white;margin:0;font-size:26px;font-weight:700;
+    letter-spacing:-0.5px">📚 PDF Q&A Assistant</h1>
+    <p style="color:rgba(255,255,255,0.75);margin:6px 0 0;font-size:14px">
+    RAG-powered document intelligence · Step-by-step Math Solver</p>
+    </div>
+    """)
+
+    with gr.Tabs():
+
+        with gr.Tab("📄 PDF Q&A"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 📂 Upload Document")
+                    pdf_input = gr.File(
+                        label="Drop your PDF here",
+                        file_types=[".pdf"]
+                    )
+                    upload_btn = gr.Button(
+                        "🔍 Index PDF",
+                        variant="primary"
+                    )
+                    status = gr.Textbox(
+                        label="Status",
+                        interactive=False,
+                        placeholder="Waiting for PDF..."
+                    )
+                    gr.Markdown("""
+                    <div style="background:#f0f7ff;border:1px solid #bfdbfe;
+                    border-radius:10px;padding:14px;margin-top:8px">
+                    <p style="margin:0;font-size:12px;color:#1e40af;font-weight:600">
+                    💡 Suggested Questions</p>
+                    <p style="margin:6px 0 0;font-size:12px;color:#3b82f6">
+                    • What is the main topic?<br>
+                    • Summarize chapter 1<br>
+                    • What are key formulas?<br>
+                    • Explain with examples</p>
+                    </div>
+                    """)
+
+                with gr.Column(scale=2):
+                    gr.Markdown("### 💬 Chat")
+                    chatbot1 = gr.Chatbot(
+                        label="",
+                        height=380,
+                        show_label=False
+                    )
+                    q1 = gr.Textbox(
+                        label="Your Question",
+                        placeholder="Ask anything about your PDF...",
+                        lines=2
+                    )
+                    ask_btn = gr.Button("➤ Ask", variant="primary")
+
+            upload_btn.click(process_pdf, inputs=pdf_input, outputs=status)
+            ask_btn.click(answer_question, inputs=[q1, chatbot1], outputs=chatbot1)
+            q1.submit(answer_question, inputs=[q1, chatbot1], outputs=chatbot1)
+
+        with gr.Tab("🔢 Math Solver"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("""
+                    <div style="background:#f0f7ff;border:1px solid #bfdbfe;
+                    border-radius:10px;padding:16px">
+                    <p style="margin:0;font-size:13px;color:#1e40af;font-weight:600">
+                    📌 Examples</p>
+                    <p style="margin:8px 0 0;font-size:12px;color:#374151;line-height:1.8">
+                    • Solve: ∫x² dx<br>
+                    • Derivative of sin(x)cos(x)<br>
+                    • Quadratic: x² - 5x + 6 = 0<br>
+                    • Determinant of [[1,2],[3,4]]<br>
+                    • Integrate x³ + 2x from 0 to 3<br>
+                    • Solve: 2x + 3y = 7, x - y = 1
+                    </p>
+                    </div>
+                    """)
+
+                with gr.Column(scale=2):
+                    gr.Markdown("### 🧮 Step-by-Step Solver")
+                    chatbot2 = gr.Chatbot(
+                        label="",
+                        height=380,
+                        show_label=False
+                    )
+                    q2 = gr.Textbox(
+                        label="Math Problem",
+                        placeholder="Type your math problem here...",
+                        lines=2
+                    )
+                    solve_btn = gr.Button("🧮 Solve Step by Step", variant="primary")
+
+            solve_btn.click(solve_math, inputs=[q2, chatbot2], outputs=chatbot2)
+            q2.submit(solve_math, inputs=[q2, chatbot2], outputs=chatbot2)
+
+    gr.Markdown("""
+    <div style="text-align:center;padding:16px;color:#94a3b8;font-size:12px;margin-top:8px">
+    Built with ❤️ using Groq · FAISS · Sentence Transformers · Gradio
+    </div>
+    """)
+
+app.launch(share=True)
+
+def ask_groq(question, context_chunks):
+    context = "\n\n".join(context_chunks)
+    prompt = f"""Answer the question using only the context below.
+
+Context:
+{context}
+
+Question: {question}
+
+If the answer is not in the context, say "I couldn't find that in the document."
+"""
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024
+    )
+    return response.choices[0].message.content
+
+print("✅ Groq updated!")
+
+models = client.models.list()
+for m in models.data:
+    print(m.id)models = client.models.list()
+for m in models.data:
+    print(m.id)
+
+def ask_groq(question, context_chunks):
+    context = "\n\n".join(context_chunks)
+    prompt = f"""Answer the question using only the context below.
+
+Context:
+{context}
+
+Question: {question}
+
+If the answer is not in the context, say "I couldn't find that in the document."
+"""
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",  # ✅ Working model
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024
+    )
+    return response.choices[0].message.content
+
+print("✅ Groq updated with working model!")
+
+def process_pdf(pdf_file):
+    global pdf_indexed
+    try:
+        print(f"⏳ Processing {pdf_file.name}...")
+        text = extract_text_from_pdf(pdf_file.name)
+        print(f"✅ Extracted {len(text)} characters")
+
+        chunks = chunk_text(text, chunk_size=300, overlap=30)
+        print(f"✅ Created {len(chunks)} chunks")
+
+        build_vector_store(chunks)
+        pdf_indexed = True
+        return f"✅ PDF indexed! {len(chunks)} chunks ready!"
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
+
